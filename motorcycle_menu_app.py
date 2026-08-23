@@ -587,7 +587,8 @@ def build_tree_from_excel(path):
     if not _ensure_openpyxl():
         raise RuntimeError("برای خواندن فایل اکسل، پکیج openpyxl لازمه و نصب/فعال نشد.")
     import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
+    # data_only=False: متن سلول‌های منو (نه نتیجهٔ فرمول) خوانده شود
+    wb = openpyxl.load_workbook(path, data_only=False, read_only=False, keep_vba=False)
 
     missing = [s for s in REQUIRED_SHEETS if s not in wb.sheetnames]
     if missing:
@@ -830,11 +831,8 @@ class App(tk.Tk):
         self._load_motorcycle_data()
         self._screen_refresh()
 
-    def _sync_excels_from_github(self, parent=None, from_startup=False, silent_if_none=False, force_all=False):
-        """
-        بدون مانیفست: فایل‌های شناخته‌شده را با سرور مقایسه می‌کند.
-        force_all=True → دانلود اجباری همهٔ فایل‌های موجود روی سرور.
-        """
+    def _sync_excels_from_github(self, parent=None, from_startup=False, silent_if_none=False):
+        """فایل‌های شناخته‌شده را با سرور مقایسه می‌کند و در صورت نیاز پیشنهاد آپدیت می‌دهد."""
         parent = parent or self
         base = GITHUB_EXCEL_RAW_BASE
         token = None
@@ -844,7 +842,7 @@ class App(tk.Tk):
 
         try:
             updates = find_updates_without_manifest(
-                base, local_meta, self.diag_folder, token=token, force_all=force_all)
+                base, local_meta, self.diag_folder, token=token, force_all=False)
         except Exception as e:
             if not silent_if_none and not from_startup:
                 self.after(0, lambda: messagebox.showwarning(
@@ -858,21 +856,19 @@ class App(tk.Tk):
         if not updates:
             if not silent_if_none and not from_startup:
                 self.after(0, lambda: messagebox.showinfo(
-                    "به‌روزرسانی",
-                    "همهٔ فایل‌های اکسل با سرور یکسان هستند.\n"
-                    "اگر مطمئنید فایل را عوض کرده‌اید، دکمهٔ «دانلود اجباری» را بزنید.",
+                    "بروزرسانی دیتا",
+                    "دیتا با سرور یکسان است؛ تغییری نیست.",
                     parent=parent))
             return True
 
         names = "\n".join(f"  • {u['download_name']}" for u in updates)
 
         def ask_and_download():
-            title = "دانلود اجباری از سرور" if force_all else "نیازمند به‌روزرسانی"
-            msg = (
-                f"{len(updates)} فایل از سرور دریافت می‌شود:\n\n{names}\n\n"
-                "ادامه داده شود؟"
-            )
-            ok = messagebox.askyesno(title, msg, parent=parent)
+            ok = messagebox.askyesno(
+                "نیازمند به‌روزرسانی",
+                f"{len(updates)} فایل روی سرور جدیدتر است:\n\n{names}\n\n"
+                "بروزرسانی دیتا انجام شود؟",
+                parent=parent)
             if not ok:
                 return
             self._run_excel_download(updates, base, token, parent)
@@ -880,18 +876,67 @@ class App(tk.Tk):
         self.after(0, ask_and_download)
         return True
 
-    def _check_excel_updates(self, silent_if_none=False, parent=None, force_all=False):
-        """دکمهٔ تنظیمات: بررسی / دانلود اجباری از سرور."""
+    def _check_excel_updates(self, silent_if_none=False, parent=None):
+        """دکمهٔ تنظیمات: بروزرسانی دیتا."""
         def worker():
             try:
                 self._sync_excels_from_github(
                     parent=parent or self,
                     from_startup=False,
-                    silent_if_none=silent_if_none,
-                    force_all=force_all)
+                    silent_if_none=silent_if_none)
             except Exception:
                 pass
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_changes_window(self, change_rows, parent=None):
+        """بعد از آپدیت موفق، لیست فایل‌های تغییرکرده را در یک پنجره نشان می‌دهد."""
+        parent = parent or self
+        win = tk.Toplevel(parent)
+        win.title("تغییرات دیتا")
+        win.transient(parent)
+        win.geometry("480x360")
+        win.minsize(400, 280)
+
+        tk.Label(
+            win,
+            text="فایل‌هایی که در این بروزرسانی دریافت شدند:",
+            font=(FONT_FA, 11, "bold"),
+            anchor="e", justify="right").pack(fill="x", padx=14, pady=(14, 6))
+
+        frame = tk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=14, pady=4)
+
+        scroll = tk.Scrollbar(frame)
+        scroll.pack(side="left", fill="y")
+        txt = tk.Text(
+            frame, font=(FONT_FA, 10), wrap="word", yscrollcommand=scroll.set,
+            padx=8, pady=8)
+        txt.pack(side="right", fill="both", expand=True)
+        scroll.config(command=txt.yview)
+
+        lines = []
+        for i, row in enumerate(change_rows, 1):
+            name = row.get("name") or "—"
+            status = row.get("status") or "به‌روز شد"
+            old_s = row.get("old_size")
+            new_s = row.get("new_size")
+            size_txt = ""
+            if old_s is not None or new_s is not None:
+                def _fmt(n):
+                    if n is None:
+                        return "—"
+                    if n >= 1024 * 1024:
+                        return f"{n / (1024 * 1024):.1f} MB"
+                    return f"{n / 1024:.0f} KB"
+                size_txt = f"  |  {_fmt(old_s)} → {_fmt(new_s)}"
+            lines.append(f"{i}. {name}\n   {status}{size_txt}")
+        body = "\n\n".join(lines) if lines else "موردی ثبت نشد."
+        txt.insert("1.0", body)
+        txt.config(state="disabled")
+
+        tk.Button(
+            win, text="بستن", font=(FONT_FA, 10, "bold"),
+            command=win.destroy, pady=8).pack(fill="x", padx=14, pady=12)
 
     def _run_excel_download(self, updates, base, token, parent, on_done=None):
         """دانلود فایل‌ها با نوار پیشرفت ساده (پنجرهٔ modal)."""
@@ -911,11 +956,18 @@ class App(tk.Tk):
         def do_download():
             local_meta = dict(self.config.get(CFG_LOCAL_EXCEL_META) or {})
             errors = []
+            change_rows = []
             for i, u in enumerate(updates):
                 self.after(0, lambda i=i, n=u["download_name"]: (
                     bar.configure(value=i),
                     status.configure(text=f"دانلود: {n}"),
                     lbl.configure(text=f"فایل {i + 1} از {len(updates)}")))
+                old_size = None
+                try:
+                    if os.path.isfile(u["local_path"]):
+                        old_size = os.path.getsize(u["local_path"])
+                except OSError:
+                    old_size = (local_meta.get(u["rel_path"]) or {}).get("size")
                 try:
                     sha = download_excel_file(
                         base, u["rel_path"], u["local_path"], token=token)
@@ -928,6 +980,13 @@ class App(tk.Tk):
                         "size": size,
                         "sha256": sha or "",
                     }
+                    status_txt = "جدید" if old_size is None else "به‌روز شد"
+                    change_rows.append({
+                        "name": u["download_name"],
+                        "status": status_txt,
+                        "old_size": old_size,
+                        "new_size": size,
+                    })
                 except Exception as e:
                     errors.append(f"{u['download_name']}: {e}")
             self.config[CFG_LOCAL_EXCEL_META] = local_meta
@@ -940,21 +999,29 @@ class App(tk.Tk):
                     progress.destroy()
                 except Exception:
                     pass
+                self.car_maker_data = {}
+                self.car_maker_source = {}
+                self.data = None
+                self.motorcycle_data = None
+                ok = self._load_motorcycle_data()
+                self.clear_all()
+                try:
+                    self._screen_refresh()
+                except Exception:
+                    pass
                 if errors:
                     messagebox.showwarning(
                         "دانلود ناقص",
                         "برخی فایل‌ها از سرور دانلود نشدند:\n\n" + "\n".join(errors),
                         parent=parent)
+                elif ok:
+                    self._show_update_changes_window(change_rows, parent=parent)
                 else:
-                    messagebox.showinfo(
-                        "موفق",
-                        f"{len(updates)} فایل از سرور دریافت شد.\n"
-                        "دادهٔ برنامه بارگذاری می‌شود.",
+                    messagebox.showwarning(
+                        "دانلود شد ولی منو خالی است",
+                        "فایل اکسل دریافت شد اما ساختار منو از آن خوانده نشد.\n"
+                        "شیت‌های Vehicles / Option / Unit / Ecu_Menu را در اکسل بررسی کنید.",
                         parent=parent)
-                self.car_maker_data = {}
-                self.car_maker_source = {}
-                self._load_motorcycle_data()
-                self.clear_all()
                 if on_done:
                     try:
                         on_done(success)
@@ -1158,34 +1225,22 @@ class App(tk.Tk):
             self._settings_overlay = None
 
         def on_check_updates():
-            self._check_excel_updates(silent_if_none=False, parent=self, force_all=False)
-
-        def on_force_download():
-            self._check_excel_updates(silent_if_none=False, parent=self, force_all=True)
+            self._check_excel_updates(silent_if_none=False, parent=self)
 
         check_btn = tk.Button(
-            body, text="بررسی و دانلود از سرور",
-            font=(FONT_FA, 11, "bold"),
+            body, text="بروزرسانی دیتا",
+            font=(FONT_FA, 12, "bold"),
             bg=DEV_HEADER_BG, fg="#ffffff",
             activebackground=DEV_HEADER_HOVER, activeforeground="#ffffff",
             bd=0, relief="flat", cursor=self.click_cursor,
-            command=on_check_updates, pady=12)
-        check_btn.pack(fill="x", pady=(4, 6))
+            command=on_check_updates, pady=14)
+        check_btn.pack(fill="x", pady=(8, 10))
         check_btn.bind("<Enter>", lambda e: check_btn.configure(bg=DEV_HEADER_HOVER))
         check_btn.bind("<Leave>", lambda e: check_btn.configure(bg=DEV_HEADER_BG))
 
-        force_btn = tk.Button(
-            body, text="دانلود اجباری همهٔ اکسل‌ها از سرور",
-            font=(FONT_FA, 10, "bold"),
-            bg="#64748b", fg="#ffffff",
-            activebackground="#475569", activeforeground="#ffffff",
-            bd=0, relief="flat", cursor=self.click_cursor,
-            command=on_force_download, pady=10)
-        force_btn.pack(fill="x", pady=(0, 8))
-
         tk.Label(
             body,
-            text="اول اکسل را روی گیت‌هاب آپلود کنید،\nبعد این دکمه‌ها را بزنید.",
+            text="در صورت وجود نسخهٔ جدید روی سرور،\nبعد از تأیید دانلود می‌شود و تغییرات نشان داده می‌شود.",
             font=(FONT_FA, 8), bg="#ffffff", fg="#94a3b8",
             justify="right", anchor="e").pack(fill="x")
 
