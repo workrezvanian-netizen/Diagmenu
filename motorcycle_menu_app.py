@@ -67,8 +67,11 @@ CONFIG_FILE = "app_settings.json"
 REQUIRED_SHEETS = ["Vehicles", "Option", "Unit", "Ecu_Menu"]
 # آدرس ثابت ریپوی فایل‌های اکسل روی گیت‌هاب (قابل تغییر توسط کاربر نیست)
 GITHUB_EXCEL_RAW_BASE = "https://raw.githubusercontent.com/workrezvanian-netizen/DiagExcelFiles/main"
-# وضعیت فایل‌های دانلود‌شده: rel_path -> {etag, size, sha256}
-CFG_LOCAL_EXCEL_META = "local_excel_meta"
+GITHUB_REPO_API = "https://api.github.com/repos/workrezvanian-netizen/DiagExcelFiles/contents"
+# فقط یک عدد نسخه روی سرور (data_version.txt) — برنامه فقط همین را چک می‌کند
+DATA_VERSION_FILE = "data_version.txt"
+CFG_DATA_VERSION = "data_version"           # آخرین نسخهٔ دانلود‌شده
+CFG_LOCAL_EXCEL_META = "local_excel_meta"   # متای کمکی فایل‌ها
 
 # کش محلی فایل‌های دانلود‌شده از گیت‌هاب (دیگر از پوشهٔ اکسل کاربر خوانده نمی‌شود)
 CACHE_DIR_NAME = "excel_cache"
@@ -349,26 +352,124 @@ def _http_head_meta(url, token=None, timeout=20):
         return None
 
 
-def known_excel_rel_paths():
-    """لیست مسیرهای نسبی فایل‌های اکسل روی ریپوی گیت‌هاب."""
-    paths = [f"Diag_Menu/{MOTORCYCLE_EXCEL_NAME}"]
+def _list_github_folder_excels(folder_name, token=None):
+    """لیست فایل‌های اکسل داخل یک پوشه روی گیت‌هاب (Diag_Menu یا Diag_Database)."""
+    url = f"{GITHUB_REPO_API}/{folder_name}"
+    try:
+        raw = _http_get_bytes(url, token=token, timeout=30)
+        items = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("type") != "file":
+            continue
+        name = it.get("name") or ""
+        if name.startswith("~$"):
+            continue
+        if os.path.splitext(name)[1].lower() not in (".xlsx", ".xlsm", ".xls"):
+            continue
+        out.append(f"{folder_name}/{name}")
+    return out
+
+
+def known_excel_rel_paths(token=None):
+    """
+    مسیرهای نسبی اکسل روی گیت‌هاب:
+    - Diag_Menu: لیست از API + فایل‌های شناخته‌شده منو
+    - Diag_Database: همهٔ اکسل‌های پوشه از API
+    """
+    paths = []
+    seen = set()
+
+    def add(p):
+        p = p.replace("\\", "/")
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    # منوی دیاگ
+    for p in _list_github_folder_excels("Diag_Menu", token=token):
+        add(p)
+    add(f"Diag_Menu/{MOTORCYCLE_EXCEL_NAME}")
     for fname, _label in CAR_MAKER_FILES:
-        paths.append(f"Diag_Menu/{fname}")
+        add(f"Diag_Menu/{fname}")
+
+    # دیتابیس
+    for p in _list_github_folder_excels("Diag_Database", token=token):
+        add(p)
+
     return paths
 
 
-def find_updates_without_manifest(base_url, local_meta, diag_folder, token=None, force_all=False):
+def fetch_remote_data_version(base_url, token=None):
     """
-    بدون مانیفست: برای هر فایل شناخته‌شده، وجود محلی + ETag/اندازه سرور را چک می‌کند.
-    force_all=True → همهٔ فایل‌های موجود روی سرور را دوباره دانلود می‌کند.
+    عدد نسخه را از data_version.txt روی سرور می‌خواند.
+    فقط همین یک فایل برای تشخیص آپدیت کافی است.
+    """
+    base = (base_url or "").rstrip("/")
+    url = f"{base}/{DATA_VERSION_FILE}"
+    try:
+        raw = _http_get_bytes(url, token=token, timeout=15)
+        text = raw.decode("utf-8", errors="ignore").strip()
+        # فقط رقم‌ها را بگیر (مثلاً "12" یا "version 12")
+        digits = "".join(ch for ch in text.split()[0] if ch.isdigit()) if text else ""
+        if not digits:
+            return None
+        return int(digits)
+    except Exception:
+        return None
+
+
+def collect_all_excel_updates(base_url, diag_folder, database_folder, token=None):
+    """وقتی نسخه عوض شده، همهٔ اکسل‌های منو و دیتابیس را برای دانلود لیست می‌کند."""
+    base = (base_url or "").rstrip("/")
+    updates = []
+    for rel_path in known_excel_rel_paths(token=token):
+        name = rel_path.split("/", 1)[-1]
+        lower = rel_path.lower()
+        if lower.startswith("diag_database/"):
+            local_path = os.path.join(database_folder, name)
+            folder_label = "Database"
+        else:
+            local_path = os.path.join(diag_folder, name)
+            folder_label = "Menu"
+        url = f"{base}/{rel_path}"
+        meta = _http_head_meta(url, token=token)
+        if meta is not None and meta.get("status") == 404:
+            continue
+        updates.append({
+            "rel_path": rel_path,
+            "local_path": local_path,
+            "download_name": name,
+            "folder_label": folder_label,
+            "remote_etag": (meta or {}).get("etag") or "",
+            "remote_size": (meta or {}).get("size"),
+        })
+    return updates
+
+
+def find_updates_without_manifest(base_url, local_meta, diag_folder, database_folder,
+                                  token=None, force_all=False):
+    """
+    برای هر فایل اکسل منو و دیتابیس روی سرور، با نسخهٔ محلی مقایسه می‌کند.
     """
     base = (base_url or "").rstrip("/")
     updates = []
     local_meta = local_meta or {}
 
-    for rel_path in known_excel_rel_paths():
+    for rel_path in known_excel_rel_paths(token=token):
         name = rel_path.split("/", 1)[-1]
-        local_path = os.path.join(diag_folder, name)
+        lower = rel_path.lower()
+        if lower.startswith("diag_database/"):
+            local_path = os.path.join(database_folder, name)
+            folder_label = "Database"
+        else:
+            local_path = os.path.join(diag_folder, name)
+            folder_label = "Menu"
+
         url = f"{base}/{rel_path}"
         meta = _http_head_meta(url, token=token)
 
@@ -383,6 +484,7 @@ def find_updates_without_manifest(base_url, local_meta, diag_folder, token=None,
                 "rel_path": rel_path,
                 "local_path": local_path,
                 "download_name": name,
+                "folder_label": folder_label,
                 "remote_etag": remote_etag,
                 "remote_size": remote_size,
             })
@@ -398,7 +500,6 @@ def find_updates_without_manifest(base_url, local_meta, diag_folder, token=None,
         except OSError:
             disk_size = None
 
-        # ETag فرق کند (حتی اگر قبلاً ذخیره نشده)، یا اندازه فرق کند
         needs = False
         if remote_etag and remote_etag != local_etag:
             needs = True
@@ -410,6 +511,7 @@ def find_updates_without_manifest(base_url, local_meta, diag_folder, token=None,
                 "rel_path": rel_path,
                 "local_path": local_path,
                 "download_name": name,
+                "folder_label": folder_label,
                 "remote_etag": remote_etag,
                 "remote_size": remote_size,
             })
@@ -832,17 +934,18 @@ class App(tk.Tk):
         self._screen_refresh()
 
     def _sync_excels_from_github(self, parent=None, from_startup=False, silent_if_none=False):
-        """فایل‌های شناخته‌شده را با سرور مقایسه می‌کند و در صورت نیاز پیشنهاد آپدیت می‌دهد."""
+        """
+        فقط عدد data_version.txt روی سرور را چک می‌کند.
+        اگر از نسخهٔ محلی بزرگ‌تر باشد → همهٔ اکسل‌های منو و دیتابیس را دانلود می‌کند.
+        """
         parent = parent or self
         base = GITHUB_EXCEL_RAW_BASE
         token = None
         self.diag_folder = diag_cache_folder()
         self.database_folder = database_cache_folder()
-        local_meta = self.config.get(CFG_LOCAL_EXCEL_META) or {}
 
         try:
-            updates = find_updates_without_manifest(
-                base, local_meta, self.diag_folder, token=token, force_all=False)
+            remote_ver = fetch_remote_data_version(base, token=token)
         except Exception as e:
             if not silent_if_none and not from_startup:
                 self.after(0, lambda: messagebox.showwarning(
@@ -853,25 +956,67 @@ class App(tk.Tk):
                     parent=parent))
             return False
 
-        if not updates:
+        if remote_ver is None:
+            if not silent_if_none and not from_startup:
+                self.after(0, lambda: messagebox.showwarning(
+                    "بروزرسانی دیتا",
+                    f"فایل {DATA_VERSION_FILE} روی سرور پیدا نشد یا عدد معتبر نیست.\n"
+                    "یک فایل متنی با یک عدد (مثلاً 1) در ریشهٔ ریپو بگذارید.",
+                    parent=parent))
+            return False
+
+        try:
+            local_ver = int(self.config.get(CFG_DATA_VERSION) or 0)
+        except (TypeError, ValueError):
+            local_ver = 0
+
+        # اگر هنوز هیچ فایلی دانلود نشده، حتی با نسخهٔ برابر هم یک‌بار دانلود شود
+        menu_empty = not any(
+            fn.lower().endswith((".xlsx", ".xlsm", ".xls"))
+            for fn in (os.listdir(self.diag_folder) if os.path.isdir(self.diag_folder) else [])
+        )
+
+        if remote_ver <= local_ver and not menu_empty:
             if not silent_if_none and not from_startup:
                 self.after(0, lambda: messagebox.showinfo(
                     "بروزرسانی دیتا",
-                    "دیتا با سرور یکسان است؛ تغییری نیست.",
+                    f"دیتا به‌روز است.\nنسخهٔ فعلی: {local_ver}",
                     parent=parent))
             return True
 
-        names = "\n".join(f"  • {u['download_name']}" for u in updates)
+        try:
+            updates = collect_all_excel_updates(
+                base, self.diag_folder, self.database_folder, token=token)
+        except Exception as e:
+            if not silent_if_none and not from_startup:
+                self.after(0, lambda: messagebox.showerror(
+                    "خطا", f"لیست فایل‌های سرور گرفته نشد:\n{e}", parent=parent))
+            return False
+
+        if not updates:
+            if not silent_if_none and not from_startup:
+                self.after(0, lambda: messagebox.showwarning(
+                    "بروزرسانی دیتا",
+                    "نسخهٔ جدید هست ولی هیچ فایل اکسلی روی سرور پیدا نشد.\n"
+                    "پوشه‌های Diag_Menu و Diag_Database را روی گیت‌هاب بررسی کنید.",
+                    parent=parent))
+            return False
+
+        names = "\n".join(
+            f"  • [{u.get('folder_label', '')}] {u['download_name']}" for u in updates)
 
         def ask_and_download():
             ok = messagebox.askyesno(
                 "نیازمند به‌روزرسانی",
-                f"{len(updates)} فایل روی سرور جدیدتر است:\n\n{names}\n\n"
+                f"نسخهٔ سرور: {remote_ver}\n"
+                f"نسخهٔ فعلی شما: {local_ver}\n\n"
+                f"{len(updates)} فایل دانلود می‌شود:\n\n{names}\n\n"
                 "بروزرسانی دیتا انجام شود؟",
                 parent=parent)
             if not ok:
                 return
-            self._run_excel_download(updates, base, token, parent)
+            self._run_excel_download(
+                updates, base, token, parent, remote_version=remote_ver)
 
         self.after(0, ask_and_download)
         return True
@@ -888,57 +1033,23 @@ class App(tk.Tk):
                 pass
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_update_changes_window(self, change_rows, parent=None):
-        """بعد از آپدیت موفق، لیست فایل‌های تغییرکرده را در یک پنجره نشان می‌دهد."""
+    def _show_update_changes_popup(self, change_rows, parent=None):
+        """پاپ‌آپ ساده با دکمه OK برای نمایش تغییرات این بروزرسانی."""
         parent = parent or self
-        win = tk.Toplevel(parent)
-        win.title("تغییرات دیتا")
-        win.transient(parent)
-        win.geometry("480x360")
-        win.minsize(400, 280)
-
-        tk.Label(
-            win,
-            text="فایل‌هایی که در این بروزرسانی دریافت شدند:",
-            font=(FONT_FA, 11, "bold"),
-            anchor="e", justify="right").pack(fill="x", padx=14, pady=(14, 6))
-
-        frame = tk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=14, pady=4)
-
-        scroll = tk.Scrollbar(frame)
-        scroll.pack(side="left", fill="y")
-        txt = tk.Text(
-            frame, font=(FONT_FA, 10), wrap="word", yscrollcommand=scroll.set,
-            padx=8, pady=8)
-        txt.pack(side="right", fill="both", expand=True)
-        scroll.config(command=txt.yview)
-
         lines = []
         for i, row in enumerate(change_rows, 1):
             name = row.get("name") or "—"
+            folder = row.get("folder_label") or ""
             status = row.get("status") or "به‌روز شد"
-            old_s = row.get("old_size")
-            new_s = row.get("new_size")
-            size_txt = ""
-            if old_s is not None or new_s is not None:
-                def _fmt(n):
-                    if n is None:
-                        return "—"
-                    if n >= 1024 * 1024:
-                        return f"{n / (1024 * 1024):.1f} MB"
-                    return f"{n / 1024:.0f} KB"
-                size_txt = f"  |  {_fmt(old_s)} → {_fmt(new_s)}"
-            lines.append(f"{i}. {name}\n   {status}{size_txt}")
-        body = "\n\n".join(lines) if lines else "موردی ثبت نشد."
-        txt.insert("1.0", body)
-        txt.config(state="disabled")
+            prefix = f"[{folder}] " if folder else ""
+            lines.append(f"{i}. {prefix}{name} — {status}")
+        body = "\n".join(lines) if lines else "موردی ثبت نشد."
+        messagebox.showinfo(
+            "تغییرات دیتا",
+            f"این فایل‌ها به‌روز شدند:\n\n{body}",
+            parent=parent)
 
-        tk.Button(
-            win, text="بستن", font=(FONT_FA, 10, "bold"),
-            command=win.destroy, pady=8).pack(fill="x", padx=14, pady=12)
-
-    def _run_excel_download(self, updates, base, token, parent, on_done=None):
+    def _run_excel_download(self, updates, base, token, parent, on_done=None, remote_version=None):
         """دانلود فایل‌ها با نوار پیشرفت ساده (پنجرهٔ modal)."""
         progress = tk.Toplevel(parent)
         progress.title("دانلود از سرور")
@@ -983,6 +1094,7 @@ class App(tk.Tk):
                     status_txt = "جدید" if old_size is None else "به‌روز شد"
                     change_rows.append({
                         "name": u["download_name"],
+                        "folder_label": u.get("folder_label") or "",
                         "status": status_txt,
                         "old_size": old_size,
                         "new_size": size,
@@ -990,6 +1102,8 @@ class App(tk.Tk):
                 except Exception as e:
                     errors.append(f"{u['download_name']}: {e}")
             self.config[CFG_LOCAL_EXCEL_META] = local_meta
+            if remote_version is not None and not errors:
+                self.config[CFG_DATA_VERSION] = int(remote_version)
             save_config(self.config)
             success = not errors
 
@@ -1015,7 +1129,11 @@ class App(tk.Tk):
                         "برخی فایل‌ها از سرور دانلود نشدند:\n\n" + "\n".join(errors),
                         parent=parent)
                 elif ok:
-                    self._show_update_changes_window(change_rows, parent=parent)
+                    try:
+                        self._update_database_shortcut()
+                    except Exception:
+                        pass
+                    self._show_update_changes_popup(change_rows, parent=parent)
                 else:
                     messagebox.showwarning(
                         "دانلود شد ولی منو خالی است",
