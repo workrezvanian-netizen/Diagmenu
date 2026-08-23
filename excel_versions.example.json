@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-08-23T12:00:00",
+  "note": "این فایل را با نام excel_versions.json در ریشهٔ ریپوی گیت‌هاب قرار دهید. مسیرها نسبت به همان ریشه هستند.",
+  "files": {
+    "Diag_Menu/18_MotorCycle.xlsm": {
+      "version": "1.0.0",
+      "sha256": "جایگزین_با_هش_واقعی_فایل"
+    },
+    "Diag_Menu/01_IranKhodro.xlsm": {
+      "version": "1.0.0",
+      "sha256": "جایگزین_با_هش_واقعی_فایل"
+    },
+    "Diag_Menu/02_Saipa.xlsm": {
+      "version": "1.0.0",
+      "sha256": "جایگزین_با_هش_واقعی_فایل"
+    },
+    "Diag_Database/example_db.xlsm": {
+      "version": "1.0.0",
+      "sha256": "جایگزین_با_هش_واقعی_فایل"
+    }
+  }
+}
